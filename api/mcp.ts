@@ -1,11 +1,18 @@
 // api/mcp.ts
 // Minimal, tolerant JSON-RPC router for MCP tools on Vercel (no SDK transport).
 // - Implements: tools/list, tools/call
-// - Accepts: strict JSON-RPC 2.0 *and* tolerant envelopes (method-only, missing jsonrpc/id)
 // - Robust body parsing (object/string/Buffer/Uint8Array) with BOM stripping
-// - Always returns JSON bodies (even on 4xx)
+// - Always returns JSON bodies (even on 4xx/5xx)
+// - IMPORTANT: dynamically imports amelloTools *inside* the handler to avoid top-level crashes.
 
-import { registerAmelloTools } from "./_lib/amelloTools.js";
+type ToolOptions = {
+  name: string;
+  description?: string;
+  inputSchema?: any;
+  outputSchema?: any;
+};
+type ToolHandler = (args: any) => Promise<any> | any;
+type ToolEntry = ToolOptions & { handler: ToolHandler };
 
 /* -------------------- CORS & response helpers -------------------- */
 function setCors(res: any) {
@@ -42,3 +49,49 @@ async function readStreamUtf8(req: any): Promise<string | undefined> {
 async function getJsonBody(req: any): Promise<{ obj?: any; err?: string; preview?: string }> {
   if (req.method !== "POST") return {};
   const ct = String(req.headers["content-type"] || "").toLowerCase();
+
+  // 1) Already-parsed JSON from Vercel
+  if (ct.includes("application/json") && req.body != null && typeof req.body === "object" && !Buffer.isBuffer(req.body) && !isTypedArray(req.body)) {
+    try { return { obj: req.body, preview: JSON.stringify(req.body).slice(0, 160) }; }
+    catch { return { err: "Could not serialize parsed JSON body" }; }
+  }
+
+  // 2) String / Buffer / Uint8Array in req.body
+  if (req.body != null) {
+    try {
+      let s: string | undefined;
+      if (typeof req.body === "string") s = req.body;
+      else if (Buffer.isBuffer(req.body)) s = req.body.toString("utf8");
+      else if (isTypedArray(req.body)) s = Buffer.from(req.body).toString("utf8");
+      if (s != null) {
+        s = stripBOM(s);
+        const obj = JSON.parse(s);
+        return { obj, preview: s.slice(0, 160) };
+      }
+    } catch { return { err: "Invalid JSON in req.body" }; }
+  }
+
+  // 3) Fallback: read stream
+  const fromStream = await readStreamUtf8(req);
+  if (fromStream != null) {
+    try {
+      const s = stripBOM(fromStream);
+      const obj = JSON.parse(s);
+      return { obj, preview: s.slice(0, 160) };
+    } catch { return { err: "Invalid JSON in request stream" }; }
+  }
+
+  return { err: "Missing request body" };
+}
+
+/* -------------------- Tool registry shim -------------------- */
+function captureTools(registerFn: (serverLike: any) => void): ToolEntry[] {
+  const tools: ToolEntry[] = [];
+  const register = (opts: ToolOptions, handler: ToolHandler) => {
+    if (!opts?.name || typeof handler !== "function") throw new Error("registerTool requires {name,...} and a handler(args)=>result");
+    tools.push({ ...opts, handler });
+  };
+  const serverLike = {
+    registerTool: register,
+    tool: register, // alias (covers both styles)
+    onNotification: () =

@@ -17,17 +17,21 @@ const sessionIdGenerator = () => {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 };
 
-// Robustly obtain a raw JSON body string for POST
-async function getRawBody(req: VercelRequest): Promise<string | undefined> {
+/** Read the request body as either an already-parsed object (Vercel) or a raw string (fallback). */
+async function getJsonRpcPayload(req: VercelRequest): Promise<any> {
   if (req.method !== "POST") return undefined;
 
-  // Vercel often gives parsed JSON at req.body
-  if (typeof req.body === "string") return req.body;
-  if (req.body && typeof req.body === "object") {
-    try { return JSON.stringify(req.body); } catch { /* fall through */ }
+  const ct = String(req.headers["content-type"] || "").toLowerCase();
+
+  // Vercel usually parses JSON automatically
+  if (ct.includes("application/json") && req.body != null) {
+    // If it's already an object, pass the object (let transport stringify/validate)
+    if (typeof req.body === "object") return req.body;
+    // If it's already a JSON string, pass string
+    if (typeof req.body === "string") return req.body;
   }
 
-  // Fallback: read the stream (in case bodyParser didn't run)
+  // Fallback: read raw bytes and return string
   const chunks: Buffer[] = [];
   return await new Promise<string | undefined>((resolve) => {
     (req as any).on("data", (c: Buffer) => chunks.push(Buffer.from(c)));
@@ -47,20 +51,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
+  // Nice UX for opening the endpoint in a browser (no event-stream Accept)
+  if (req.method === "GET") {
+    const accept = String(req.headers["accept"] || "");
+    if (!accept.includes("text/event-stream")) {
+      return res.status(200).json({
+        ok: true,
+        message:
+          "MCP endpoint ready. Use POST with JSON-RPC for requests, or GET with Accept: text/event-stream for sessions.",
+      });
+    }
+  }
+
   try {
-    const rawBody = await getRawBody(req);
-    console.log("[mcp] method=%s path=%s accept=%s bodyLen=%s",
-      req.method, req.url, req.headers["accept"], rawBody?.length ?? 0);
+    const payload = await getJsonRpcPayload(req);
+
+    console.log(
+      "[mcp] method=%s path=%s ct=%s accept=%s hasBody=%s",
+      req.method,
+      req.url,
+      req.headers["content-type"],
+      req.headers["accept"],
+      payload != null
+    );
 
     const server = new McpServer({ name: "amello-remote", version: "1.0.0" });
     registerAmelloTools(server);
 
-    // Pass options so constructor doesn't read from undefined
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator });
     await server.connect(transport);
 
-    // IMPORTANT: pass the raw body so the transport sees the JSON-RPC envelope
-    await transport.handleRequest(req as any, res as any, rawBody);
+    // IMPORTANT: pass the payload (object or string). If undefined, the transport will handle non-POSTs.
+    await transport.handleRequest(req as any, res as any, payload);
   } catch (err: any) {
     console.error("[mcp] error:", err?.stack || err);
     res.status(500).json({

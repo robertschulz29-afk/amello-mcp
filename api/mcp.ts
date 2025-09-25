@@ -1,9 +1,6 @@
 // api/mcp.ts
-// Minimal JSON-RPC router for MCP tools on Vercel (SDK transport bypass).
-// - Implements: tools/list, tools/call
-// - Accepts: single or batch JSON-RPC 2.0 requests
-// - Robust body parsing (object/string/Buffer/Uint8Array)
-// - No @vercel/node or SDK HTTP transport required
+// Minimal JSON-RPC router for MCP tools on Vercel (SDK transport bypass)
+// Always writes a JSON body (even on 400), with explicit headers.
 
 import { registerAmelloTools } from "./_lib/amelloTools.js";
 
@@ -13,6 +10,14 @@ function setCors(res: any) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, HEAD, OPTIONS");
 }
+function sendJson(res: any, status: number, obj: any) {
+  const str = JSON.stringify(obj);
+  res.statusCode = status;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.setHeader("content-length", Buffer.byteLength(str, "utf8").toString());
+  res.end(str);
+}
+
 const isTypedArray = (x: any): x is Uint8Array =>
   x && typeof x === "object" && typeof (x as any).byteLength === "number" && typeof (x as any).BYTES_PER_ELEMENT === "number";
 const stripBOM = (s: string) => (s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
@@ -147,13 +152,16 @@ async function handleRpcSingle(reqObj: JsonRpcReq, tools: ToolEntry[]) {
 export default async function handler(req: any, res: any) {
   setCors(res);
 
-  if (req.method === "OPTIONS" || req.method === "HEAD") return res.status(204).end();
+  if (req.method === "OPTIONS" || req.method === "HEAD") {
+    res.statusCode = 204;
+    return res.end();
+  }
 
   // Friendly GET for browsers
   if (req.method === "GET") {
     const accept = String(req.headers["accept"] || "");
     if (!accept.includes("text/event-stream")) {
-      return res.status(200).json({
+      return sendJson(res, 200, {
         ok: true,
         message: "MCP endpoint ready. POST JSON-RPC to this URL, or GET with Accept: text/event-stream for sessions.",
       });
@@ -161,7 +169,7 @@ export default async function handler(req: any, res: any) {
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json(rpcError(null, -32601, "Method not allowed"));
+    return sendJson(res, 405, rpcError(null, -32601, "Method not allowed"));
   }
 
   const { obj, err, preview } = await getJsonBody(req);
@@ -172,7 +180,7 @@ export default async function handler(req: any, res: any) {
   );
 
   if (!obj) {
-    return res.status(400).json(rpcError(null, -32700, "Parse error", err || "Invalid JSON"));
+    return sendJson(res, 400, rpcError(null, -32700, "Parse error", err || "Invalid JSON"));
   }
 
   // Capture tools (once per invocation)
@@ -181,7 +189,7 @@ export default async function handler(req: any, res: any) {
     TOOLS = captureTools(registerAmelloTools);
   } catch (e: any) {
     console.error("[mcp] tool registration failed:", e?.stack || e);
-    return res.status(500).json(rpcError(null, -32603, "Internal error", "Tool registration failed"));
+    return sendJson(res, 500, rpcError(null, -32603, "Internal error", "Tool registration failed"));
   }
 
   try {
@@ -191,14 +199,14 @@ export default async function handler(req: any, res: any) {
         if (!isJsonRpcReq(it)) return rpcError(it?.id, -32600, "Invalid Request");
         return handleRpcSingle(it, TOOLS);
       }));
-      return res.status(200).json(results);
+      return sendJson(res, 200, results);
     } else {
-      if (!isJsonRpcReq(obj)) return res.status(400).json(rpcError(obj.id, -32600, "Invalid Request"));
+      if (!isJsonRpcReq(obj)) return sendJson(res, 400, rpcError(obj.id, -32600, "Invalid Request"));
       const result = await handleRpcSingle(obj, TOOLS);
-      return res.status(200).json(result);
+      return sendJson(res, 200, result);
     }
   } catch (e: any) {
     console.error("[mcp] call failed:", e?.stack || e);
-    return res.status(500).json(rpcError(null, -32603, "Internal error", e?.message || String(e)));
+    return sendJson(res, 500, rpcError(null, -32603, "Internal error", e?.message || String(e)));
   }
 }

@@ -18,14 +18,12 @@ const sessionIdGenerator = () => {
 };
 
 function isTypedArray(x: any): x is Uint8Array {
-  return x && typeof x === "object" && typeof (x as any).byteLength === "number" && typeof (x as any).BYTES_PER_ELEMENT === "number";
+  return x && typeof x === "object" && typeof (x as any).byteLength === "number"
+    && typeof (x as any).BYTES_PER_ELEMENT === "number";
 }
-
 function stripBOM(s: string) {
-  // Remove UTF-8 BOM if present
-  return s.charCodeAt(0) === 0xFEFF ? s.slice(1) : s;
+  return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
 }
-
 async function readStreamUtf8(req: VercelRequest): Promise<string | undefined> {
   const chunks: Buffer[] = [];
   return await new Promise<string | undefined>((resolve) => {
@@ -39,84 +37,78 @@ async function readStreamUtf8(req: VercelRequest): Promise<string | undefined> {
   });
 }
 
-/**
- * Always return a clean JSON string ready for the MCP transport,
- * or an error message describing why we couldn't produce one.
- */
-async function getJsonRpcString(req: VercelRequest): Promise<{ json?: string; error?: string }> {
+/** Parse and validate a JSON-RPC 2.0 envelope as an OBJECT. */
+async function getJsonRpcEnvelope(req: VercelRequest): Promise<{ env?: any; error?: { code: number; message: string; data?: string } }> {
   if (req.method !== "POST") return {};
 
   const ct = String(req.headers["content-type"] || "").toLowerCase();
 
-  // 1) If Vercel parsed JSON already, stringify it
+  let raw: string | undefined;
+  let parsed: any;
+
+  // 1) If Vercel parsed JSON already, use it
   if (ct.includes("application/json") && req.body != null && typeof req.body === "object" && !Buffer.isBuffer(req.body) && !isTypedArray(req.body)) {
+    parsed = req.body;
+  } else {
+    // 2) Normalize req.body to string if present
+    if (typeof req.body === "string") raw = req.body;
+    else if (Buffer.isBuffer(req.body)) raw = req.body.toString("utf8");
+    else if (isTypedArray(req.body)) raw = Buffer.from(req.body).toString("utf8");
+
+    // 3) Fallback: read stream
+    if (raw == null) raw = await readStreamUtf8(req);
+
+    if (!raw) {
+      return { error: { code: -32700, message: "Parse error", data: "Missing request body" } };
+    }
     try {
-      return { json: JSON.stringify(req.body) };
+      parsed = JSON.parse(stripBOM(raw));
     } catch {
-      return { error: "Could not serialize parsed JSON body" };
+      return { error: { code: -32700, message: "Parse error", data: "Invalid JSON" } };
     }
   }
 
-  // 2) If we have string/Buffer/Uint8Array in req.body, normalize to string
-  if (req.body != null) {
-    try {
-      let s: string | undefined;
-      if (typeof req.body === "string") s = req.body;
-      else if (Buffer.isBuffer(req.body)) s = req.body.toString("utf8");
-      else if (isTypedArray(req.body)) s = Buffer.from(req.body).toString("utf8");
-      if (s != null) return { json: stripBOM(s) };
-    } catch {
-      /* fallthrough */
-    }
+  // Minimal JSON-RPC 2.0 validation (shape-only; transport will do deeper checks)
+  if (!parsed || typeof parsed !== "object" || parsed.jsonrpc !== "2.0" || typeof parsed.method !== "string") {
+    return { error: { code: -32600, message: "Invalid Request", data: "Not a JSON-RPC 2.0 object with method" } };
   }
-
-  // 3) Fallback: read the stream
-  const fromStream = await readStreamUtf8(req);
-  if (fromStream != null) return { json: stripBOM(fromStream) };
-
-  return { error: "Missing request body" };
+  return { env: parsed };
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(res);
 
-  // Preflight / HEAD
   if (req.method === "OPTIONS" || req.method === "HEAD") {
     return res.status(204).end();
   }
 
-  // Friendly GET (opening the URL in a browser without event-stream)
+  // If you open the URL in a browser tab (no event-stream Accept), return a friendly JSON.
   if (req.method === "GET") {
     const accept = String(req.headers["accept"] || "");
     if (!accept.includes("text/event-stream")) {
       return res.status(200).json({
         ok: true,
-        message: "MCP endpoint ready. POST JSON-RPC to this URL, or GET with Accept: text/event-stream for sessions.",
+        message: "MCP endpoint ready. POST JSON-RPC envelopes here, or GET with Accept: text/event-stream to establish a session.",
       });
     }
   }
 
   try {
-    const { json, error } = await getJsonRpcString(req);
+    const { env, error } = await getJsonRpcEnvelope(req);
 
     console.log(
-      "[mcp] method=%s path=%s ct=%s accept=%s hasJson=%s error=%s preview=%s",
+      "[mcp] method=%s path=%s ct=%s accept=%s env=%s error=%s",
       req.method,
       req.url,
       req.headers["content-type"],
       req.headers["accept"],
-      json ? "yes" : "no",
-      error || "none",
-      json ? JSON.stringify(json.slice(0, 80)) : ""
+      env ? "yes" : "no",
+      error ? `${error.code}:${error.message}` : "none"
     );
 
-    // If POST and we couldn't get a JSON string, return a JSON-RPC parse error (400)
-    if (req.method === "POST" && !json) {
-      return res.status(400).json({
-        jsonrpc: "2.0",
-        error: { code: -32700, message: "Parse error", data: error || "Invalid request" },
-        id: null,
-      });
+    if (req.method === "POST" && error) {
+      // Return proper JSON-RPC error envelope (400) for client-side parse/shape problems
+      return res.status(400).json({ jsonrpc: "2.0", error, id: null });
     }
 
     const server = new McpServer({ name: "amello-remote", version: "1.0.0" });
@@ -125,8 +117,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator });
     await server.connect(transport);
 
-    // IMPORTANT: always pass a string for POST; let transport parse it.
-    await transport.handleRequest(req as any, res as any, json);
+    // CRITICAL: pass a validated OBJECT, not a string/buffer.
+    await transport.handleRequest(req as any, res as any, env);
   } catch (err: any) {
     console.error("[mcp] error:", err?.stack || err);
     res.status(500).json({

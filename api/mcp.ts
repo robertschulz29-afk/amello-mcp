@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { registerAmelloTools } from "../src/amelloTools";
+import { registerAmelloTools } from "./_lib/amelloTools.ts"
 
 
 function setCors(res: VercelResponse) {

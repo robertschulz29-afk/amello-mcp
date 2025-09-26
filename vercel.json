@@ -1,1 +1,6 @@
-
+{
+  "functions": {
+    "api/mcp.js":   { "runtime": "nodejs20.x" },
+    "api/debug.js": { "runtime": "nodejs20.x" }
+  }
+}

@@ -1,3 +1,10 @@
+// CommonJS, single-file MCP JSON-RPC endpoint for Vercel.
+// No TypeScript, no build, no external deps.
+
+const DEFAULT_API_BASE = "https://prod-api.amello.plusline.net/api/v1";
+const API_BASE = process.env.API_BASE || DEFAULT_API_BASE;
+const TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 30000);
+
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
@@ -20,21 +27,21 @@ async function readStreamUtf8(req) {
   const chunks = [];
   return await new Promise((resolve) => {
     req.on?.("data", (c) => chunks.push(Buffer.from(c)));
-    req.on?.("end", () => {
-      const s = Buffer.concat(chunks).toString("utf8");
-      resolve(s.length ? s : undefined);
-    });
-    req.on?.("error", () => resolve(undefined));
+    req.on?.("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on?.("error", () => resolve(""));
   });
 }
 async function getJsonBody(req) {
-  if (req.method !== "POST") return {};
+  if (req.method !== "POST") return { obj: undefined, preview: undefined, err: undefined };
   const ct = String(req.headers["content-type"] || "").toLowerCase();
 
-  if (ct.includes("application/json") && req.body != null && typeof req.body === "object" && !Buffer.isBuffer(req.body) && !isTypedArray(req.body)) {
+  // Already-parsed object
+  if (ct.includes("application/json") && req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body) && !isTypedArray(req.body)) {
     try { return { obj: req.body, preview: JSON.stringify(req.body).slice(0, 160) }; }
     catch { return { err: "Could not serialize parsed JSON body" }; }
   }
+
+  // String/buffer/typed array
   if (req.body != null) {
     try {
       let s;
@@ -48,14 +55,14 @@ async function getJsonBody(req) {
       }
     } catch { return { err: "Invalid JSON in req.body" }; }
   }
-  const fromStream = await readStreamUtf8(req);
-  if (fromStream != null) {
-    try {
-      const s = stripBOM(fromStream);
-      const obj = JSON.parse(s);
-      return { obj, preview: s.slice(0, 160) };
-    } catch { return { err: "Invalid JSON in request stream" }; }
+
+  // Stream fallback
+  const s = stripBOM(await readStreamUtf8(req));
+  if (s) {
+    try { const obj = JSON.parse(s); return { obj, preview: s.slice(0, 160) }; }
+    catch { return { err: "Invalid JSON in request stream" }; }
   }
+
   return { err: "Missing request body" };
 }
 
@@ -64,7 +71,51 @@ function normalizeReq(x) {
   if (typeof x.method === "string") return { jsonrpc: "2.0", id: x.id ?? null, method: x.method, params: x.params };
   return null;
 }
-function captureTools(registerFn) {
+
+function bearerHeaders() {
+  const t = process.env.AMELLO_API_TOKEN;
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+function applyPathParams(route, pathParams = {}) {
+  return route.replace(/\{([^}]+)\}/g, (_, key) => encodeURIComponent(String(pathParams[key])));
+}
+async function callApi(method, route, args = {}) {
+  const url = new URL(applyPathParams(route, args.pathParams || {}), API_BASE);
+  const q = args.query || {};
+  for (const [k, v] of Object.entries(q)) {
+    if (v == null) continue;
+    url.searchParams.set(k, String(v));
+  }
+
+  const headers = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    ...bearerHeaders(),
+    ...(args.headers || {})
+  };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  const init = { method: String(method || "GET").toUpperCase(), headers, signal: controller.signal };
+  if (init.method !== "GET" && init.method !== "HEAD" && args.body !== undefined) {
+    init.body = typeof args.body === "string" ? args.body : JSON.stringify(args.body);
+  }
+
+  try {
+    const res = await fetch(url.toString(), init);
+    const ct = res.headers.get("content-type") || "";
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} – ${text}`);
+    if (ct.includes("application/json")) return text ? JSON.parse(text) : {};
+    return text;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Minimal server-like tool registry */
+function makeToolRegistry() {
   const tools = [];
   const register = (opts, handler) => {
     if (!opts || typeof opts.name !== "string" || typeof handler !== "function") {
@@ -72,21 +123,344 @@ function captureTools(registerFn) {
     }
     tools.push({ ...opts, handler });
   };
-  const serverLike = { registerTool: register, tool: register, onNotification: () => {}, onRequest: () => {} };
-  registerFn(serverLike);
-  return tools;
+  return { tools, registerTool: register, tool: register };
 }
+
+/** Helper output wrappers */
+function okText(text, data) {
+  const blocks = [{ type: "text", text }];
+  return data !== undefined ? { content: blocks, structuredContent: data } : { content: blocks };
+}
+function errText(message) {
+  return { content: [{ type: "text", text: message }], isError: true };
+}
+
+/** Register all tools */
+function registerAmelloTools(server) {
+  // 0) Health
+  server.registerTool(
+    {
+      name: "ping",
+      description: "Health check",
+      inputSchema: { type: "object", additionalProperties: false, properties: {} },
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { ok: { type: "boolean" }, message: { type: "string" } },
+        required: ["ok", "message"]
+      }
+    },
+    async () => ({ content: [{ type: "text", text: "pong" }], structuredContent: { ok: true, message: "pong" } })
+  );
+
+  // 1) Booking search
+  server.registerTool(
+    {
+      name: "booking_search",
+      description: "GET /booking/search — find booking by bookingReferenceNumber + email + locale",
+      inputSchema: {
+        type: "object",
+        required: ["query"],
+        additionalProperties: false,
+        properties: {
+          headers: { type: "object", additionalProperties: true },
+          query: {
+            type: "object",
+            additionalProperties: false,
+            required: ["bookingReferenceNumber", "email", "locale"],
+            properties: {
+              bookingReferenceNumber: { type: "string", description: "Itinerary/booking reference, e.g. 45666CK000940" },
+              email: { type: "string" },
+              locale: { type: "string", enum: ["de_DE", "en_DE"] }
+            }
+          }
+        }
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          data: {
+            type: "object",
+            properties: {
+              itineraryNumber: { type: "string" },
+              user: { type: "object", properties: { email: { type: "string" }, firstName: { type: "string" }, lastName: { type: "string" } } },
+              hotel: { type: "object", properties: { id: { type: "string" }, name: { type: "string" } } },
+              currency: { type: "string" },
+              status: { type: "string" }
+            }
+          }
+        }
+      }
+    },
+    async ({ headers, query }) => {
+      try { const data = await callApi("GET", "/booking/search", { headers, query }); return okText("BookingSearch OK", data); }
+      catch (e) { return errText(`booking_search failed: ${e.message || String(e)}`); }
+    }
+  );
+
+  // 2) Booking cancel
+  server.registerTool(
+    {
+      name: "booking_cancel",
+      description: "POST /booking/cancel — cancel booking with itineraryNumber, bookingNumber, email, locale",
+      inputSchema: {
+        type: "object",
+        required: ["body"],
+        additionalProperties: false,
+        properties: {
+          headers: { type: "object", additionalProperties: true },
+          body: {
+            type: "object",
+            additionalProperties: false,
+            required: ["itineraryNumber", "bookingNumber", "email", "locale"],
+            properties: {
+              itineraryNumber: { type: "string" },
+              bookingNumber: { type: "string" },
+              email: { type: "string" },
+              locale: { type: "string", enum: ["de_DE", "en_DE"] }
+            }
+          }
+        }
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          itineraryNumber: { type: "string" },
+          bookingNumber: { type: "string" },
+          email: { type: "string" },
+          status: { type: "string", enum: ["CNCLD", "ERROR", "OK"] }
+        }
+      }
+    },
+    async ({ headers, body }) => {
+      try { const data = await callApi("POST", "/booking/cancel", { headers, body }); return okText("BookingCancel OK", data); }
+      catch (e) { return errText(`booking_cancel failed: ${e.message || String(e)}`); }
+    }
+  );
+
+  // 3) Find hotels
+  server.registerTool(
+    {
+      name: "find_hotels",
+      description: "POST /find-hotels — find hotels by destination, dates, currency, roomConfigurations, locale",
+      inputSchema: {
+        type: "object",
+        required: ["body"],
+        additionalProperties: false,
+        properties: {
+          headers: { type: "object", additionalProperties: true },
+          body: {
+            type: "object",
+            required: ["destination", "departureDate", "returnDate", "currency", "roomConfigurations", "locale"],
+            additionalProperties: true,
+            properties: {
+              destination: {
+                type: "object",
+                required: ["id", "type"],
+                properties: { id: { type: "string" }, type: { type: "string", enum: ["country-code", "city-code", "region-code"] }, label: { type: "string" } }
+              },
+              hotelId: { type: "string" },
+              departureDate: { type: "string" },
+              returnDate: { type: "string" },
+              currency: { type: "string" },
+              roomConfigurations: { type: "array", items: { type: "object" } },
+              locale: { type: "string", enum: ["de_DE", "en_DE"] }
+            }
+          }
+        }
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          data: { type: "object", properties: { results: { type: "array", items: { type: "object" } }, currency: { type: "string" } } }
+        }
+      }
+    },
+    async ({ headers, body }) => {
+      try {
+        const data = await callApi("POST", "/find-hotels", { headers, body });
+        const n = Array.isArray(data?.data?.results) ? data.data.results.length : 0;
+        return okText(`FindHotels OK (${n} results)`, data);
+      } catch (e) { return errText(`find_hotels failed: ${e.message || String(e)}`); }
+    }
+  );
+
+  // 4) Currencies
+  server.registerTool(
+    {
+      name: "currencies_list",
+      description: "GET /currencies — list supported currencies (requires locale)",
+      inputSchema: {
+        type: "object",
+        required: ["query"],
+        additionalProperties: false,
+        properties: {
+          headers: { type: "object", additionalProperties: true },
+          query: { type: "object", required: ["locale"], additionalProperties: false, properties: { locale: { type: "string", enum: ["de_DE", "en_DE"] } } }
+        }
+      },
+      outputSchema: { type: "array", items: { type: "object" } }
+    },
+    async ({ headers, query }) => {
+      try { const data = await callApi("GET", "/currencies", { headers, query }); return okText("Currencies OK", data); }
+      catch (e) { return errText(`currencies_list failed: ${e.message || String(e)}`); }
+    }
+  );
+
+  // 5) Hotels list
+  server.registerTool(
+    {
+      name: "hotels_list",
+      description: "GET /hotels — paginated hotel list (requires locale; page default 1)",
+      inputSchema: {
+        type: "object",
+        required: ["query"],
+        additionalProperties: false,
+        properties: {
+          headers: { type: "object", additionalProperties: true },
+          query: {
+            type: "object",
+            required: ["locale"],
+            additionalProperties: false,
+            properties: { locale: { type: "string", enum: ["de_DE", "en_DE"] }, page: { type: "integer", minimum: 1 } }
+          }
+        }
+      },
+      outputSchema: { type: "array", items: { type: "object" } }
+    },
+    async ({ headers, query }) => {
+      try { const data = await callApi("GET", "/hotels", { headers, query }); return okText("Hotels OK", data); }
+      catch (e) { return errText(`hotels_list failed: ${e.message || String(e)}`); }
+    }
+  );
+
+  // 6) Hotel offers
+  server.registerTool(
+    {
+      name: "hotel_offers",
+      description: "POST /hotel/offer — get hotel offers for multiple rooms",
+      inputSchema: {
+        type: "object",
+        required: ["body"],
+        additionalProperties: false,
+        properties: {
+          headers: { type: "object", additionalProperties: true },
+          body: {
+            type: "object",
+            required: ["hotelId", "departureDate", "returnDate", "currency", "roomConfigurations", "locale"],
+            additionalProperties: true,
+            properties: {
+              hotelId: { type: "string" },
+              departureDate: { type: "string" },
+              returnDate: { type: "string" },
+              currency: { type: "string" },
+              roomConfigurations: { type: "array", items: { type: "object" } },
+              locale: { type: "string", enum: ["de_DE", "en_DE"] }
+            }
+          }
+        }
+      },
+      outputSchema: { type: "object", properties: { data: { type: "object" } } }
+    },
+    async ({ headers, body }) => {
+      try { const data = await callApi("POST", "/hotel/offer", { headers, body }); return okText("HotelOffers OK", data); }
+      catch (e) { return errText(`hotel_offers failed: ${e.message || String(e)}`); }
+    }
+  );
+
+  // 7) Hotel reference
+  server.registerTool(
+    {
+      name: "hotel_reference",
+      description: "GET /hotel-reference — codes, names, rooms",
+      inputSchema: {
+        type: "object",
+        required: ["query"],
+        additionalProperties: false,
+        properties: {
+          headers: { type: "object", additionalProperties: true },
+          query: { type: "object", required: ["locale"], additionalProperties: false, properties: { locale: { type: "string", enum: ["de_DE", "en_DE"] } } }
+        }
+      },
+      outputSchema: { type: "array", items: { type: "object" } }
+    },
+    async ({ headers, query }) => {
+      try { const data = await callApi("GET", "/hotel-reference", { headers, query }); return okText("HotelReference OK", data); }
+      catch (e) { return errText(`hotel_reference failed: ${e.message || String(e)}`); }
+    }
+  );
+
+  // 8) CRAPI hotel contact
+  server.registerTool(
+    {
+      name: "crapi_hotel_contact",
+      description: "GET /crapi/hotel/contact — all hotel contact info",
+      inputSchema: {
+        type: "object",
+        required: ["query"],
+        additionalProperties: false,
+        properties: {
+          headers: { type: "object", additionalProperties: true },
+          query: { type: "object", required: ["locale"], additionalProperties: false, properties: { locale: { type: "string", enum: ["de_DE", "en_DE"] } } }
+        }
+      },
+      outputSchema: { type: "object", properties: { code: { type: "string" }, contact: { type: "object" } } }
+    },
+    async ({ headers, query }) => {
+      try { const data = await callApi("GET", "/crapi/hotel/contact", { headers, query }); return okText("CRAPI HotelContact OK", data); }
+      catch (e) { return errText(`crapi_hotel_contact failed: ${e.message || String(e)}`); }
+    }
+  );
+
+  // 9) Package offer
+  server.registerTool(
+    {
+      name: "package_offer",
+      description: "POST /offer/package — create a packaged offer",
+      inputSchema: {
+        type: "object",
+        required: ["body"],
+        additionalProperties: false,
+        properties: {
+          headers: { type: "object", additionalProperties: true },
+          body: {
+            type: "object",
+            required: ["hotelId", "departureDate", "returnDate", "currency", "roomConfigurations", "locale"],
+            additionalProperties: true,
+            properties: {
+              hotelId: { type: "string" },
+              departureDate: { type: "string" },
+              returnDate: { type: "string" },
+              currency: { type: "string" },
+              roomConfigurations: { type: "array", items: { type: "object" } },
+              locale: { type: "string", enum: ["de_DE", "en_DE"] }
+            }
+          }
+        }
+      },
+      outputSchema: { type: "object", properties: { offerId: { type: "string" } }, required: ["offerId"] }
+    },
+    async ({ headers, body }) => {
+      try { const data = await callApi("POST", "/offer/package", { headers, body }); return okText("PackageOffer OK", data); }
+      catch (e) { return errText(`package_offer failed: ${e.message || String(e)}`); }
+    }
+  );
+}
+
+/** RPC handling */
 async function handleRpcSingle(reqObj, tools) {
   const { id, method, params } = reqObj;
+
   if (method === "tools/list") {
     const list = tools.map(t => ({
       name: t.name,
-      description: t.description ?? "",
-      inputSchema: t.inputSchema ?? {},
-      outputSchema: t.outputSchema ?? {},
+      description: t.description || "",
+      inputSchema: t.inputSchema || {},
+      outputSchema: t.outputSchema || {}
     }));
     return rpcResult(id, { tools: list });
   }
+
   if (method === "tools/call") {
     const name = params?.name;
     const args = (params && (params.arguments ?? params.args)) || {};
@@ -99,10 +473,12 @@ async function handleRpcSingle(reqObj, tools) {
       return rpcError(id, -32603, "Tool execution error", e?.message || String(e));
     }
   }
+
   return rpcError(id, -32601, `Unknown method: ${method}`);
 }
 
-export default async function handler(req, res) {
+/** Vercel handler */
+module.exports = async function handler(req, res) {
   try {
     setCors(res);
 
@@ -119,46 +495,4 @@ export default async function handler(req, res) {
 
     const { obj, err, preview } = await getJsonBody(req);
     console.log("[mcp] method=%s path=%s ct=%s accept=%s hasObj=%s err=%s preview=%s",
-      req.method, req.url, req.headers["content-type"], req.headers["accept"],
-      obj ? "yes" : "no", err || "none", preview ?? "");
-
-    if (!obj) return sendJson(res, 400, rpcError(null, -32700, "Parse error", err || "Invalid JSON"));
-
-    let requests = [];
-    if (Array.isArray(obj)) {
-      for (const it of obj) {
-        const norm = normalizeReq(it);
-        if (!norm) return sendJson(res, 400, rpcError(it?.id ?? null, -32600, "Invalid Request"));
-        requests.push(norm);
-      }
-    } else {
-      const norm = normalizeReq(obj);
-      if (!norm) return sendJson(res, 400, rpcError(obj?.id ?? null, -32600, "Invalid Request"));
-      requests = [norm];
-    }
-
-    let TOOLS;
-    try {
-      const mod = await import("./_lib/amelloTools.js"); // compiled from src/amelloTools.ts
-      const registerAmelloTools = mod.registerAmelloTools;
-      if (typeof registerAmelloTools !== "function") {
-        return sendJson(res, 500, rpcError(null, -32603, "Internal error", "registerAmelloTools not exported as a function"));
-      }
-      TOOLS = captureTools(registerAmelloTools);
-    } catch (e) {
-      console.error("[mcp] amelloTools import failed:", e?.stack || e);
-      return sendJson(res, 500, rpcError(null, -32603, "Internal error", `amelloTools import failed: ${e?.message || String(e)}`));
-    }
-
-    if (requests.length === 1) {
-      const result = await handleRpcSingle(requests[0], TOOLS);
-      return sendJson(res, 200, result);
-    } else {
-      const results = await Promise.all(requests.map(r => handleRpcSingle(r, TOOLS)));
-      return sendJson(res, 200, results);
-    }
-  } catch (e) {
-    console.error("[mcp] top-level crash:", e?.stack || e);
-    return sendJson(res, 500, { error: { code: "500", message: "Top-level handler crash", detail: String(e) } });
-  }
-}
+      req.method, req.url, req.headers

@@ -31,39 +31,27 @@ async function readStreamUtf8(req) {
     req.on?.("error", () => resolve(""));
   });
 }
+
+/** IMPORTANT: do NOT access req.body on Vercel — it can throw. Always read the stream. */
 async function getJsonBody(req) {
   if (req.method !== "POST") return { obj: undefined, preview: undefined, err: undefined };
-  const ct = String(req.headers["content-type"] || "").toLowerCase();
 
-  // Already-parsed object
-  if (ct.includes("application/json") && req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body) && !isTypedArray(req.body)) {
-    try { return { obj: req.body, preview: JSON.stringify(req.body).slice(0, 160) }; }
-    catch { return { err: "Could not serialize parsed JSON body" }; }
+  // Always read raw stream; avoid req.body getter entirely
+  let raw = "";
+  try {
+    raw = stripBOM(await readStreamUtf8(req));
+  } catch {
+    return { err: "Body read error" };
   }
 
-  // String/buffer/typed array
-  if (req.body != null) {
-    try {
-      let s;
-      if (typeof req.body === "string") s = req.body;
-      else if (Buffer.isBuffer(req.body)) s = req.body.toString("utf8");
-      else if (isTypedArray(req.body)) s = Buffer.from(req.body).toString("utf8");
-      if (s != null) {
-        s = stripBOM(s);
-        const obj = JSON.parse(s);
-        return { obj, preview: s.slice(0, 160) };
-      }
-    } catch { return { err: "Invalid JSON in req.body" }; }
-  }
+  if (!raw) return { err: "Missing request body" };
 
-  // Stream fallback
-  const s = stripBOM(await readStreamUtf8(req));
-  if (s) {
-    try { const obj = JSON.parse(s); return { obj, preview: s.slice(0, 160) }; }
-    catch { return { err: "Invalid JSON in request stream" }; }
+  try {
+    const obj = JSON.parse(raw);
+    return { obj, preview: raw.slice(0, 160) };
+  } catch {
+    return { err: "Invalid JSON" };
   }
-
-  return { err: "Missing request body" };
 }
 
 function normalizeReq(x) {

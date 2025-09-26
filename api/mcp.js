@@ -495,4 +495,38 @@ module.exports = async function handler(req, res) {
 
     const { obj, err, preview } = await getJsonBody(req);
     console.log("[mcp] method=%s path=%s ct=%s accept=%s hasObj=%s err=%s preview=%s",
-      req.method, req.url, req.headers
+      req.method, req.url, req.headers["content-type"], req.headers["accept"],
+      obj ? "yes" : "no", err || "none", preview ?? "");
+
+    if (!obj) return sendJson(res, 400, rpcError(null, -32700, "Parse error", err || "Invalid JSON"));
+
+    let requests = [];
+    if (Array.isArray(obj)) {
+      for (const it of obj) {
+        const norm = normalizeReq(it);
+        if (!norm) return sendJson(res, 400, rpcError(it?.id ?? null, -32600, "Invalid Request"));
+        requests.push(norm);
+      }
+    } else {
+      const norm = normalizeReq(obj);
+      if (!norm) return sendJson(res, 400, rpcError(obj?.id ?? null, -32600, "Invalid Request"));
+      requests = [norm];
+    }
+
+    // Register tools (in-process)
+    const registry = makeToolRegistry();
+    registerAmelloTools(registry);
+    const tools = registry.tools;
+
+    if (requests.length === 1) {
+      const result = await handleRpcSingle(requests[0], tools);
+      return sendJson(res, 200, result);
+    } else {
+      const results = await Promise.all(requests.map(r => handleRpcSingle(r, tools)));
+      return sendJson(res, 200, results);
+    }
+  } catch (e) {
+    console.error("[mcp] top-level crash:", e?.stack || e);
+    return sendJson(res, 500, { error: { code: "500", message: "Top-level handler crash", detail: String(e) } });
+  }
+};

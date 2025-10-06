@@ -1,1 +1,71 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MCP Chat</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0b0c10; color: #eaecee; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  .log { background: #111317; border: 1px solid #22262d; padding: 12px; height: 60vh; overflow: auto; border-radius: 8px; }
+  .msg { margin: 10px 0; line-height: 1.35; }
+  .msg.user { color: #c8e1ff; }
+  .msg.assistant { color: #d5f5e3; }
+  .row { display: flex; gap: 8px; margin-top: 12px; }
+  textarea { flex: 1; background: #0e1116; color: #fff; border: 1px solid #2a2f39; border-radius: 8px; padding: 10px; min-height: 72px; }
+  button { background: #1f6feb; color: white; border: 0; border-radius: 8px; padding: 10px 16px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .small { font-size: 12px; color: #97a6b3; margin-top: 8px; }
+</style>
+<div class="wrap">
+  <h1>MCP Chat (OpenAI + Amello Tools)</h1>
+  <div id="log" class="log"></div>
+  <div class="row">
+    <textarea id="inp" placeholder="Ask me something… e.g., 'Search my booking 45666CK000940 with email …'"></textarea>
+    <button id="send">Send</button>
+  </div>
+  <div class="small">Back-end will auto-expose tools from <code>/api/mcp</code> to the model via function-calling.</div>
+</div>
+<script>
+const log = document.getElementById('log');
+const inp = document.getElementById('inp');
+const btn = document.getElementById('send');
+
+function add(role, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = (role === 'user' ? 'You: ' : 'Assistant: ') + text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function send() {
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = ""; btn.disabled = true;
+  add('user', text);
+  try {
+    const body = {
+      messages: [{ role: "user", content: text }]
+    };
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const json = await res.json();
+    const reply = json.reply || "(no reply)";
+    add('assistant', reply);
+  } catch (e) {
+    add('assistant', 'Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+btn.addEventListener('click', send);
+inp.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send();
+});
+</script>
+</html>
 

@@ -1,8 +1,23 @@
 // api/mcp.js
-// Single-file CommonJS MCP endpoint for Vercel with explicit outbound logging.
+// Single-file CommonJS MCP endpoint for Vercel with robust API_BASE normalization.
+// Replaces previous file — drop in and redeploy.
 
-const DEFAULT_API_BASE = process.env.API_BASE || "https://prod-api.amello.plusline.net/api/v1";
-const API_BASE = DEFAULT_API_BASE;
+const DEFAULT_API_ROOT = "https://prod-api.amello.plusline.net";
+const DEFAULT_API_PATH = "/api/v1";
+const RAW_API_BASE = (process.env.API_BASE || DEFAULT_API_ROOT).trim();
+
+function normalizeApiBase(rawBase) {
+  // Remove trailing slashes
+  let base = rawBase.replace(/\/+$/g, "");
+  // If the provided value already contains "/api/v1" anywhere, keep base up to that path
+  const idx = base.indexOf(DEFAULT_API_PATH);
+  if (idx !== -1) {
+    return base.slice(0, idx + DEFAULT_API_PATH.length);
+  }
+  // Otherwise append the default API path
+  return base + DEFAULT_API_PATH;
+}
+const API_BASE = normalizeApiBase(RAW_API_BASE);
 const TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 30000);
 
 function setCors(res) {
@@ -71,8 +86,12 @@ function applyPathParams(route, pathParams = {}) {
 }
 
 async function callApi(method, route, args = {}) {
-  // Build URL + query
-  const url = new URL(applyPathParams(route, args.pathParams || {}), API_BASE);
+  // Ensure route begins with a leading slash
+  let rawRoute = String(route || "");
+  if (!rawRoute.startsWith("/")) rawRoute = "/" + rawRoute;
+
+  // Build URL + query using normalized API_BASE
+  const url = new URL(applyPathParams(rawRoute, args.pathParams || {}), API_BASE);
   const q = args.query || {};
   for (const [k, v] of Object.entries(q)) {
     if (v == null) continue;
@@ -86,13 +105,11 @@ async function callApi(method, route, args = {}) {
     ...(args.headers || {})
   };
 
-  // body preview (safe)
   let bodyPreview = undefined;
   if (args.body !== undefined) {
     try { bodyPreview = typeof args.body === "string" ? args.body.slice(0, 1024) : JSON.stringify(args.body).slice(0, 1024); } catch { bodyPreview = "<unable to serialize body>"; }
   }
 
-  // LOG OUTBOUND (explicit and immediate)
   console.log("[mcp:debug] OUTBOUND", {
     url: url.toString(),
     method: String(method || "GET").toUpperCase(),
@@ -144,11 +161,13 @@ function okText(text, data) { const blocks = [{ type: "text", text }]; return da
 function errText(message) { return { content: [{ type: "text", text: message }], isError: true }; }
 
 function registerAmelloTools(server) {
+  // Ping
   server.registerTool(
     { name: "ping", description: "Health check", inputSchema: { type: "object", additionalProperties: false, properties: {} }, outputSchema: { type: "object", additionalProperties: false, properties: { ok: { type: "boolean" }, message: { type: "string" } }, required: ["ok","message"] } },
     async () => ({ content: [{ type: "text", text: "pong" }], structuredContent: { ok: true, message: "pong" } })
   );
 
+  // find_hotels
   server.registerTool(
     { name: "find_hotels", description: "POST /find-hotels", inputSchema: { type: "object", required: ["body"], properties: { headers: { type: "object" }, body: { type: "object" } }, additionalProperties: false }, outputSchema: { type: "object", properties: { data: { type: "object" } } } },
     async ({ headers, body }) => {
@@ -160,6 +179,7 @@ function registerAmelloTools(server) {
     }
   );
 
+  // currencies_list
   server.registerTool(
     { name: "currencies_list", description: "GET /currencies", inputSchema: { type: "object", required: ["query"], properties: { headers: { type: "object" }, query: { type: "object" } }, additionalProperties: false }, outputSchema: { type: "array", items: { type: "object" } } },
     async ({ headers, query }) => {
@@ -168,6 +188,7 @@ function registerAmelloTools(server) {
     }
   );
 
+  // booking_search
   server.registerTool(
     { name: "booking_search", description: "GET /booking/search", inputSchema: { type: "object", required: ["query"], properties: { headers: { type: "object" }, query: { type: "object" } }, additionalProperties: false }, outputSchema: { type: "object", properties: { data: { type: "object" } } } },
     async ({ headers, query }) => {
@@ -176,6 +197,7 @@ function registerAmelloTools(server) {
     }
   );
 
+  // booking_cancel
   server.registerTool(
     { name: "booking_cancel", description: "POST /booking/cancel", inputSchema: { type: "object", required: ["body"], properties: { headers: { type: "object" }, body: { type: "object" } }, additionalProperties: false }, outputSchema: { type: "object", properties: { itineraryNumber: { type: "string" }, bookingNumber: { type: "string" }, email: { type: "string" }, status: { type: "string" } } } },
     async ({ headers, body }) => {
@@ -184,6 +206,7 @@ function registerAmelloTools(server) {
     }
   );
 
+  // hotels_list
   server.registerTool(
     { name: "hotels_list", description: "GET /hotels", inputSchema: { type: "object", required: ["query"], properties: { headers: { type: "object" }, query: { type: "object" } }, additionalProperties: false }, outputSchema: { type: "array", items: { type: "object" } } },
     async ({ headers, query }) => {
@@ -192,6 +215,7 @@ function registerAmelloTools(server) {
     }
   );
 
+  // hotel_offers
   server.registerTool(
     { name: "hotel_offers", description: "POST /hotel/offer", inputSchema: { type: "object", required: ["body"], properties: { headers: { type: "object" }, body: { type: "object" } }, additionalProperties: false }, outputSchema: { type: "object", properties: { data: { type: "object" } } } },
     async ({ headers, body }) => {
@@ -200,6 +224,7 @@ function registerAmelloTools(server) {
     }
   );
 
+  // hotel_reference
   server.registerTool(
     { name: "hotel_reference", description: "GET /hotel-reference", inputSchema: { type: "object", required: ["query"], properties: { headers: { type: "object" }, query: { type: "object" } }, additionalProperties: false }, outputSchema: { type: "array", items: { type: "object" } } },
     async ({ headers, query }) => {
@@ -208,6 +233,7 @@ function registerAmelloTools(server) {
     }
   );
 
+  // crapi_hotel_contact
   server.registerTool(
     { name: "crapi_hotel_contact", description: "GET /crapi/hotel/contact", inputSchema: { type: "object", required: ["query"], properties: { headers: { type: "object" }, query: { type: "object" } }, additionalProperties: false }, outputSchema: { type: "object", properties: { code: { type: "string" }, contact: { type: "object" } } } },
     async ({ headers, query }) => {
@@ -216,6 +242,7 @@ function registerAmelloTools(server) {
     }
   );
 
+  // package_offer
   server.registerTool(
     { name: "package_offer", description: "POST /offer/package", inputSchema: { type: "object", required: ["body"], properties: { headers: { type: "object" }, body: { type: "object" } }, additionalProperties: false }, outputSchema: { type: "object", properties: { offerId: { type: "string" } }, required: ["offerId"] } },
     async ({ headers, body }) => {
@@ -291,7 +318,7 @@ module.exports = async function handler(req, res) {
     if (req.method !== "POST") return sendJson(res, 405, rpcError(null, -32601, "Method not allowed"));
 
     const { obj, err, preview } = await getJsonBody(req);
-    console.log("[mcp] method=%s path=%s ct=%s accept=%s hasObj=%s err=%s preview=%s", req.method, req.url, req.headers["content-type"], req.headers["accept"], !!obj, err || "none", preview);
+    console.log("[mcp] method=%s path=%s ct=%s accept=%s hasObj=%s err=%s preview=%s API_BASE=%s", req.method, req.url, req.headers["content-type"], req.headers["accept"], !!obj, err || "none", preview, API_BASE);
 
     if (err) {
       console.error("[mcp] top-level crash: %s", err);

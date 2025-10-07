@@ -2,9 +2,9 @@
 // Single-file CommonJS MCP endpoint for Vercel with robust API_BASE normalization.
 // Replaces previous file — drop in and redeploy.
 
-const DEFAULT_API_ROOT = "https://prod-api.amello.plusline.net";
-const DEFAULT_API_PATH = "/api/v1";
-const RAW_API_BASE = (process.env.API_BASE || DEFAULT_API_ROOT).trim();
+const DEFAULT_API_ROOT = "https://prod-api.amello.plusline.net/api/v1";
+const DEFAULT_API_PATH = DEFAULT_API_ROOT;
+const RAW_API_BASE = DEFAULT_API_ROOT;
 
 function normalizeApiBase(rawBase) {
   // Remove trailing slashes

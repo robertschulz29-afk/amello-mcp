@@ -1,15 +1,28 @@
 // api/mcp.js
-// Single-file CommonJS MCP JSON-RPC endpoint for Vercel.
-// Drop this into your repo at api/mcp.js and redeploy.
+// Complete drop-in MCP JSON-RPC endpoint for Vercel.
+// Fix: ensures API_BASE always uses /api/v1 so outbound URLs are correct.
 //
-// Environment vars:
-//  - API_BASE (optional) defaults to https://prod-api.amello.plusline.net/api/v1
-//  - AMELLO_API_TOKEN (optional) Bearer token for Amello API
-//  - API_TIMEOUT_MS (optional) timeout for outbound requests in ms (default 30000)
+// Env:
+//  - API_BASE (optional) e.g. https://prod-api.amello.plusline.net or https://prod-api.amello.plusline.net/api/v1
+//  - AMELLO_API_TOKEN (optional)
+//  - API_TIMEOUT_MS (optional, ms)
 
 const DEFAULT_API_BASE = "https://prod-api.amello.plusline.net/api/v1";
-const API_BASE = process.env.API_BASE || DEFAULT_API_BASE;
+const RAW_API_BASE = process.env.API_BASE || DEFAULT_API_BASE;
 const TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 30000);
+
+// normalize API base so it ALWAYS ends with "/api/v1" and has no trailing slash beyond that
+function normalizeApiBase(raw) {
+  if (!raw || typeof raw !== "string") return DEFAULT_API_BASE;
+  let s = raw.trim();
+  // remove trailing slash(es)
+  s = s.replace(/\/+$/, "");
+  if (!s.endsWith("/api/v1")) {
+    s = s + "/api/v1";
+  }
+  return s;
+}
+const API_BASE = normalizeApiBase(RAW_API_BASE);
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -28,14 +41,12 @@ function sendJson(res, status, obj) {
 const rpcResult = (id, result) => ({ jsonrpc: "2.0", id: id ?? null, result });
 const rpcError  = (id, code, message, data) => ({ jsonrpc: "2.0", id: id ?? null, error: { code, message, data } });
 
-// helpers for body parsing that avoid touching req.body getter (Vercel)
 function isTypedArray(x) { return x && typeof x === "object" && typeof x.byteLength === "number" && typeof x.BYTES_PER_ELEMENT === "number"; }
 function stripBOM(s) { return s && s.charCodeAt(0) === 0xFEFF ? s.slice(1) : s; }
 
 async function readStreamUtf8(req) {
   const chunks = [];
   return await new Promise((resolve) => {
-    // req may be a stream or already parsed
     try {
       req.on?.("data", (c) => chunks.push(Buffer.from(c)));
       req.on?.("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
@@ -46,20 +57,15 @@ async function readStreamUtf8(req) {
   });
 }
 
-// Safely obtain JSON object from POST body for Vercel or local dev
 async function getJsonBody(req) {
-  // Only parse POST requests; non-POST returns undefined obj
   if (req.method !== "POST") return { obj: undefined, preview: undefined, err: undefined };
-
   const ct = String(req.headers["content-type"] || "").toLowerCase();
 
-  // If platform already provided parsed body as an object (common in some adapters)
   if (ct.includes("application/json") && req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body) && !isTypedArray(req.body)) {
     try { return { obj: req.body, preview: JSON.stringify(req.body).slice(0, 160) }; }
     catch { return { err: "Could not serialize parsed JSON body" }; }
   }
 
-  // If body exists as string/buffer property (rare), try to parse it
   if (req.body != null) {
     try {
       let s;
@@ -76,7 +82,6 @@ async function getJsonBody(req) {
     }
   }
 
-  // Stream fallback: read the request stream
   const s = stripBOM(await readStreamUtf8(req));
   if (s) {
     try { const obj = JSON.parse(s); return { obj, preview: s.slice(0, 160) }; }
@@ -86,29 +91,38 @@ async function getJsonBody(req) {
   return { err: "Missing request body" };
 }
 
-// Bearer token helper
 function bearerHeaders() {
   const t = process.env.AMELLO_API_TOKEN;
   return t ? { Authorization: `Bearer ${t}` } : {};
 }
 
-// apply path params like /resource/{id}
+// apply path parameters for routes like /booking/{id}
 function applyPathParams(route, pathParams = {}) {
   return String(route || "").replace(/\{([^}]+)\}/g, (_, key) => encodeURIComponent(String(pathParams[key] ?? "")));
 }
 
-// ---------- DEBUG callApi: logs outbound URL, headers, body and response ----------
+// Fixed callApi: always prepend normalized API_BASE + route (rawPath must start with '/')
 async function callApi(method, route, args = {}) {
   const start = Date.now();
+  // ensure route starts with '/'
   const rawPath = (typeof route === "string" && route.startsWith("/")) ? route : `/${String(route || "")}`;
-  const url = new URL(rawPath, API_BASE);
 
+  // apply path params first
+  const appliedPath = applyPathParams(rawPath, args.pathParams || {});
+
+  // build final URL by concatenating API_BASE + appliedPath
+  // API_BASE already normalized to .../api/v1 (no trailing slash)
+  const urlString = API_BASE + appliedPath;
+  const url = new URL(urlString);
+
+  // append query params
   const q = args.query || {};
   for (const [k, v] of Object.entries(q)) {
     if (v == null) continue;
     url.searchParams.set(k, String(v));
   }
 
+  // headers + body
   const headers = {
     Accept: "application/json",
     "Content-Type": "application/json",
@@ -122,6 +136,7 @@ async function callApi(method, route, args = {}) {
     catch { init.body = String(args.body); }
   }
 
+  // previews for logs
   const bodyPreview = typeof init.body === "string" ? init.body.slice(0, 2000) : undefined;
   const headersPreview = {};
   for (const k of Object.keys(headers)) headersPreview[k] = String(headers[k]).slice(0, 400);
@@ -165,7 +180,7 @@ async function callApi(method, route, args = {}) {
   }
 }
 
-// ---------- Minimal tool registry ----------
+// Minimal tool registry
 function makeToolRegistry() {
   const tools = [];
   const register = (opts, handler) => {
@@ -177,7 +192,7 @@ function makeToolRegistry() {
   return { tools, registerTool: register, tool: register };
 }
 
-// Helpers for response formatting that MCP clients expect
+// Simple wrappers
 function okText(text, data) {
   const blocks = [{ type: "text", text }];
   return data !== undefined ? { content: blocks, structuredContent: data } : { content: blocks };
@@ -186,62 +201,19 @@ function errText(message) {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 
-// Register Amello tools into the registry
+// Register tools (same set as you requested)
 function registerAmelloTools(server) {
-  // 0) Health - ping
   server.registerTool(
-    {
-      name: "ping",
-      description: "Health check",
-      inputSchema: { type: "object", additionalProperties: false, properties: {} },
-      outputSchema: {
-        type: "object",
-        additionalProperties: false,
-        properties: { ok: { type: "boolean" }, message: { type: "string" } },
-        required: ["ok", "message"]
-      }
-    },
+    { name: "ping", description: "Health check", inputSchema: { type: "object", additionalProperties: false, properties: {} }, outputSchema: { type: "object", properties: { ok: { type: "boolean" }, message: { type: "string" } }, required: ["ok","message"] } },
     async () => ({ content: [{ type: "text", text: "pong" }], structuredContent: { ok: true, message: "pong" } })
   );
 
-  // Booking search
   server.registerTool(
     {
       name: "booking_search",
       description: "GET /booking/search — find booking by bookingReferenceNumber + email + locale",
-      inputSchema: {
-        type: "object",
-        required: ["query"],
-        additionalProperties: false,
-        properties: {
-          headers: { type: "object", additionalProperties: true },
-          query: {
-            type: "object",
-            additionalProperties: false,
-            required: ["bookingReferenceNumber", "email", "locale"],
-            properties: {
-              bookingReferenceNumber: { type: "string", description: "Itinerary/booking reference, e.g. 45666CK000940" },
-              email: { type: "string" },
-              locale: { type: "string", enum: ["de_DE", "en_DE"] }
-            }
-          }
-        }
-      },
-      outputSchema: {
-        type: "object",
-        properties: {
-          data: {
-            type: "object",
-            properties: {
-              itineraryNumber: { type: "string" },
-              user: { type: "object", properties: { email: { type: "string" }, firstName: { type: "string" }, lastName: { type: "string" } } },
-              hotel: { type: "object", properties: { id: { type: "string" }, name: { type: "string" } } },
-              currency: { type: "string" },
-              status: { type: "string" }
-            }
-          }
-        }
-      }
+      inputSchema: { type: "object", required: ["query"], additionalProperties: false, properties: { headers: { type: "object", additionalProperties: true }, query: { type: "object", additionalProperties: false, required: ["bookingReferenceNumber","email","locale"], properties: { bookingReferenceNumber: { type: "string" }, email: { type: "string" }, locale: { type: "string", enum: ["de_DE","en_DE"] } } } } },
+      outputSchema: { type: "object", properties: { data: { type: "object" } } }
     },
     async ({ headers, query }) => {
       try { const data = await callApi("GET", "/booking/search", { headers, query }); return okText("BookingSearch OK", data); }
@@ -249,39 +221,12 @@ function registerAmelloTools(server) {
     }
   );
 
-  // Booking cancel
   server.registerTool(
     {
       name: "booking_cancel",
-      description: "POST /booking/cancel — cancel booking",
-      inputSchema: {
-        type: "object",
-        required: ["body"],
-        additionalProperties: false,
-        properties: {
-          headers: { type: "object", additionalProperties: true },
-          body: {
-            type: "object",
-            additionalProperties: false,
-            required: ["itineraryNumber", "bookingNumber", "email", "locale"],
-            properties: {
-              itineraryNumber: { type: "string" },
-              bookingNumber: { type: "string" },
-              email: { type: "string" },
-              locale: { type: "string", enum: ["de_DE", "en_DE"] }
-            }
-          }
-        }
-      },
-      outputSchema: {
-        type: "object",
-        properties: {
-          itineraryNumber: { type: "string" },
-          bookingNumber: { type: "string" },
-          email: { type: "string" },
-          status: { type: "string", enum: ["CNCLD", "ERROR", "OK"] }
-        }
-      }
+      description: "POST /booking/cancel — cancel booking with itineraryNumber, bookingNumber, email, locale",
+      inputSchema: { type: "object", required: ["body"], additionalProperties: false, properties: { headers: { type: "object", additionalProperties: true }, body: { type: "object", additionalProperties: false, required: ["itineraryNumber","bookingNumber","email","locale"], properties: { itineraryNumber: { type: "string" }, bookingNumber: { type: "string" }, email: { type: "string" }, locale: { type: "string", enum: ["de_DE","en_DE"] } } } } },
+      outputSchema: { type: "object", properties: { itineraryNumber: { type: "string" }, bookingNumber: { type: "string" }, email: { type: "string" }, status: { type: "string" } } }
     },
     async ({ headers, body }) => {
       try { const data = await callApi("POST", "/booking/cancel", { headers, body }); return okText("BookingCancel OK", data); }
@@ -289,67 +234,24 @@ function registerAmelloTools(server) {
     }
   );
 
-  // Find hotels
   server.registerTool(
     {
       name: "find_hotels",
       description: "POST /find-hotels — find hotels by destination, dates, currency, roomConfigurations, locale",
-      inputSchema: {
-        type: "object",
-        required: ["body"],
-        additionalProperties: false,
-        properties: {
-          headers: { type: "object", additionalProperties: true },
-          body: {
-            type: "object",
-            required: ["destination", "departureDate", "returnDate", "currency", "roomConfigurations", "locale"],
-            additionalProperties: true,
-            properties: {
-              destination: {
-                type: "object",
-                required: ["id", "type"],
-                properties: { id: { type: "string" }, type: { type: "string", enum: ["country-code", "city-code", "region-code"] }, label: { type: "string" } }
-              },
-              hotelId: { type: "string" },
-              departureDate: { type: "string" },
-              returnDate: { type: "string" },
-              currency: { type: "string" },
-              roomConfigurations: { type: "array", items: { type: "object" } },
-              locale: { type: "string", enum: ["de_DE", "en_DE"] }
-            }
-          }
-        }
-      },
-      outputSchema: {
-        type: "object",
-        properties: {
-          data: { type: "object", properties: { results: { type: "array", items: { type: "object" } }, currency: { type: "string" } } }
-        }
-      }
+      inputSchema: { type: "object", required: ["body"], additionalProperties: false, properties: { headers: { type: "object", additionalProperties: true }, body: { type: "object", required: ["destination","departureDate","returnDate","currency","roomConfigurations","locale"], additionalProperties: true } } },
+      outputSchema: { type: "object", properties: { data: { type: "object" } } }
     },
     async ({ headers, body }) => {
-      try {
-        const data = await callApi("POST", "/find-hotels", { headers, body });
-        const n = Array.isArray(data?.data?.results) ? data.data.results.length : 0;
-        return okText(`FindHotels OK (${n} results)`, data);
-      } catch (e) { return errText(`find_hotels failed: ${e.message || String(e)}`); }
+      try { const data = await callApi("POST", "/find-hotels", { headers, body }); const n = Array.isArray(data?.data?.results) ? data.data.results.length : 0; return okText(`FindHotels OK (${n} results)`, data); }
+      catch (e) { return errText(`find_hotels failed: ${e.message || String(e)}`); }
     }
   );
 
-  // Currencies list
   server.registerTool(
     {
       name: "currencies_list",
       description: "GET /currencies — list supported currencies (requires locale)",
-      inputSchema: {
-        type: "object",
-        required: ["query"],
-        additionalProperties: false,
-        properties: {
-          headers: { type: "object", additionalProperties: true },
-          query: { type: "object", required: ["locale"], additionalProperties: false, properties: { locale: { type: "string", enum: ["de_DE", "en_DE"] } } }
-        }
-      },
+      inputSchema: { type: "object", required: ["query"], additionalProperties: false, properties: { headers: { type: "object", additionalProperties: true }, query: { type: "object", required: ["locale"], additionalProperties: false, properties: { locale: { type: "string", enum: ["de_DE","en_DE"] } } } } },
       outputSchema: { type: "array", items: { type: "object" } }
     },
     async ({ headers, query }) => {
@@ -358,25 +260,11 @@ function registerAmelloTools(server) {
     }
   );
 
-  // Hotels list
   server.registerTool(
     {
       name: "hotels_list",
-      description: "GET /hotels — paginated hotel list (requires locale; page default 1)",
-      inputSchema: {
-        type: "object",
-        required: ["query"],
-        additionalProperties: false,
-        properties: {
-          headers: { type: "object", additionalProperties: true },
-          query: {
-            type: "object",
-            required: ["locale"],
-            additionalProperties: false,
-            properties: { locale: { type: "string", enum: ["de_DE", "en_DE"] }, page: { type: "integer", minimum: 1 } }
-          }
-        }
-      },
+      description: "GET /hotels — paginated hotel list",
+      inputSchema: { type: "object", required: ["query"], additionalProperties: false, properties: { headers: { type: "object", additionalProperties: true }, query: { type: "object", required: ["locale"], additionalProperties: false, properties: { locale: { type: "string", enum: ["de_DE","en_DE"] }, page: { type: "integer", minimum: 1 } } } } },
       outputSchema: { type: "array", items: { type: "object" } }
     },
     async ({ headers, query }) => {
@@ -385,32 +273,11 @@ function registerAmelloTools(server) {
     }
   );
 
-  // Hotel offers
   server.registerTool(
     {
       name: "hotel_offers",
       description: "POST /hotel/offer — get hotel offers for multiple rooms",
-      inputSchema: {
-        type: "object",
-        required: ["body"],
-        additionalProperties: false,
-        properties: {
-          headers: { type: "object", additionalProperties: true },
-          body: {
-            type: "object",
-            required: ["hotelId", "departureDate", "returnDate", "currency", "roomConfigurations", "locale"],
-            additionalProperties: true,
-            properties: {
-              hotelId: { type: "string" },
-              departureDate: { type: "string" },
-              returnDate: { type: "string" },
-              currency: { type: "string" },
-              roomConfigurations: { type: "array", items: { type: "object" } },
-              locale: { type: "string", enum: ["de_DE", "en_DE"] }
-            }
-          }
-        }
-      },
+      inputSchema: { type: "object", required: ["body"], additionalProperties: false, properties: { headers: { type: "object", additionalProperties: true }, body: { type: "object", required: ["hotelId","departureDate","returnDate","currency","roomConfigurations","locale"], additionalProperties: true } } },
       outputSchema: { type: "object", properties: { data: { type: "object" } } }
     },
     async ({ headers, body }) => {
@@ -419,20 +286,11 @@ function registerAmelloTools(server) {
     }
   );
 
-  // Hotel reference
   server.registerTool(
     {
       name: "hotel_reference",
       description: "GET /hotel-reference — codes, names, rooms",
-      inputSchema: {
-        type: "object",
-        required: ["query"],
-        additionalProperties: false,
-        properties: {
-          headers: { type: "object", additionalProperties: true },
-          query: { type: "object", required: ["locale"], additionalProperties: false, properties: { locale: { type: "string", enum: ["de_DE", "en_DE"] } } }
-        }
-      },
+      inputSchema: { type: "object", required: ["query"], additionalProperties: false, properties: { headers: { type: "object", additionalProperties: true }, query: { type: "object", required: ["locale"], additionalProperties: false, properties: { locale: { type: "string", enum: ["de_DE","en_DE"] } } } } },
       outputSchema: { type: "array", items: { type: "object" } }
     },
     async ({ headers, query }) => {
@@ -441,20 +299,11 @@ function registerAmelloTools(server) {
     }
   );
 
-  // CRAPI hotel contact
   server.registerTool(
     {
       name: "crapi_hotel_contact",
       description: "GET /crapi/hotel/contact — all hotel contact info",
-      inputSchema: {
-        type: "object",
-        required: ["query"],
-        additionalProperties: false,
-        properties: {
-          headers: { type: "object", additionalProperties: true },
-          query: { type: "object", required: ["locale"], additionalProperties: false, properties: { locale: { type: "string", enum: ["de_DE", "en_DE"] } } }
-        }
-      },
+      inputSchema: { type: "object", required: ["query"], additionalProperties: false, properties: { headers: { type: "object", additionalProperties: true }, query: { type: "object", required: ["locale"], additionalProperties: false, properties: { locale: { type: "string", enum: ["de_DE","en_DE"] } } } } },
       outputSchema: { type: "object", properties: { code: { type: "string" }, contact: { type: "object" } } }
     },
     async ({ headers, query }) => {
@@ -463,32 +312,11 @@ function registerAmelloTools(server) {
     }
   );
 
-  // Package offer
   server.registerTool(
     {
       name: "package_offer",
       description: "POST /offer/package — create a packaged offer",
-      inputSchema: {
-        type: "object",
-        required: ["body"],
-        additionalProperties: false,
-        properties: {
-          headers: { type: "object", additionalProperties: true },
-          body: {
-            type: "object",
-            required: ["hotelId", "departureDate", "returnDate", "currency", "roomConfigurations", "locale"],
-            additionalProperties: true,
-            properties: {
-              hotelId: { type: "string" },
-              departureDate: { type: "string" },
-              returnDate: { type: "string" },
-              currency: { type: "string" },
-              roomConfigurations: { type: "array", items: { type: "object" } },
-              locale: { type: "string", enum: ["de_DE", "en_DE"] }
-            }
-          }
-        }
-      },
+      inputSchema: { type: "object", required: ["body"], additionalProperties: false, properties: { headers: { type: "object", additionalProperties: true }, body: { type: "object", required: ["hotelId","departureDate","returnDate","currency","roomConfigurations","locale"], additionalProperties: true } } },
       outputSchema: { type: "object", properties: { offerId: { type: "string" } }, required: ["offerId"] }
     },
     async ({ headers, body }) => {
@@ -498,7 +326,7 @@ function registerAmelloTools(server) {
   );
 }
 
-// ---------- JSON-RPC handling ----------
+// Handle single RPC calls (tools/list, tools/call)
 async function handleRpcSingle(reqObj, tools) {
   const { id, method, params } = reqObj;
 
@@ -528,7 +356,7 @@ async function handleRpcSingle(reqObj, tools) {
   return rpcError(id, -32601, `Unknown method: ${method}`);
 }
 
-// ---------- Exported Vercel handler ----------
+// Vercel handler
 module.exports = async function handler(req, res) {
   try {
     setCors(res);
@@ -540,7 +368,6 @@ module.exports = async function handler(req, res) {
       if (!accept.includes("text/event-stream")) {
         return sendJson(res, 200, { ok: true, message: "MCP endpoint ready. POST JSON-RPC to this URL." });
       }
-      // SSE sessions not implemented in this simple server
       return sendJson(res, 400, rpcError(null, -32601, "SSE sessions not supported in this build"));
     }
 
@@ -561,11 +388,9 @@ module.exports = async function handler(req, res) {
       return sendJson(res, 400, rpcError(null, -32600, "Invalid Request"));
     }
 
-    // create registry and register tools
     const server = makeToolRegistry();
     registerAmelloTools(server);
 
-    // handle single call
     const result = await handleRpcSingle(reqObj, server.tools);
     return sendJson(res, 200, result);
 

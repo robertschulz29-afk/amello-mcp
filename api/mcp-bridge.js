@@ -1,9 +1,8 @@
-// /api/mcp-bridge/call
-// Fully functional Amello MCP Bridge endpoint for Vercel.
-// Accepts { "name": "tool_name", "arguments": {...} } payloads.
-// Forwards to the Amello MCP JSON-RPC server (mcp.js) internally.
+// /api/mcp-bridge.js
+// Drop-in Amello MCP HTTP bridge for Vercel
+// Accepts plain { name, arguments } and forwards to the MCP JSON-RPC endpoint.
 
-const MCP_ENDPOINT = process.env.MCP_ENDPOINT || "https://amello-mcp.vercel.app/api/mcp";
+const MCP_URL = process.env.MCP_URL || "https://amello-mcp.vercel.app/api/mcp";
 const TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 30000);
 
 function setCors(res) {
@@ -15,12 +14,15 @@ function setCors(res) {
 async function readBody(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
-  try { return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"); }
-  catch { return {}; }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  } catch {
+    return {};
+  }
 }
 
-async function proxyCall(name, args) {
-  const body = {
+async function forwardToMcp(name, args) {
+  const payload = {
     jsonrpc: "2.0",
     id: 1,
     method: "tools/call",
@@ -31,17 +33,16 @@ async function proxyCall(name, args) {
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
   try {
-    const res = await fetch(MCP_ENDPOINT, {
+    const res = await fetch(MCP_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: controller.signal
     });
-
     const text = await res.text();
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
-
     const json = JSON.parse(text);
+    // Return structured content or raw result
     return json.result?.structuredContent || json.result || json;
   } finally {
     clearTimeout(timer);
@@ -64,7 +65,7 @@ module.exports = async function handler(req, res) {
       return res.end("Missing tool name");
     }
 
-    const result = await proxyCall(name, args || {});
+    const result = await forwardToMcp(name, args || {});
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
     res.end(JSON.stringify(result));

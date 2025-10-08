@@ -1,17 +1,19 @@
 // /api/mcp-bridge.js
-// Drop-in Amello MCP HTTP bridge for Vercel
-// Accepts plain { name, arguments } and forwards to the MCP JSON-RPC endpoint.
+// Generic Amello MCP Bridge for Vercel
+// Accepts { "name": "tool_name", "arguments": {...} }
+// Converts to JSON-RPC → forwards to /api/mcp → returns structured result
 
-const MCP_URL = process.env.MCP_URL || "https://amello-mcp.vercel.app/api/mcp";
+const MCP_ENDPOINT =
+  process.env.MCP_ENDPOINT || "https://amello-mcp.vercel.app/api/mcp";
 const TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 30000);
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
 }
 
-async function readBody(req) {
+async function readJson(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
   try {
@@ -22,7 +24,7 @@ async function readBody(req) {
 }
 
 async function forwardToMcp(name, args) {
-  const payload = {
+  const body = {
     jsonrpc: "2.0",
     id: 1,
     method: "tools/call",
@@ -33,16 +35,18 @@ async function forwardToMcp(name, args) {
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
   try {
-    const res = await fetch(MCP_URL, {
+    const res = await fetch(MCP_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(body),
       signal: controller.signal
     });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
-    const json = JSON.parse(text);
-    // Return structured content or raw result
+
+    const txt = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${txt}`);
+    const json = JSON.parse(txt);
+
+    // Return structured content when available, else result, else raw
     return json.result?.structuredContent || json.result || json;
   } finally {
     clearTimeout(timer);
@@ -59,7 +63,7 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    const { name, arguments: args } = await readBody(req);
+    const { name, arguments: args } = await readJson(req);
     if (!name) {
       res.statusCode = 400;
       return res.end("Missing tool name");

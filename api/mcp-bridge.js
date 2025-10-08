@@ -1,9 +1,8 @@
 export default async function handler(req, res) {
-  const url = new URL(req.url, `https://${req.headers.host}`);
-  const path = url.pathname;
+  const { pathname } = new URL(req.url, `https://${req.headers.host}`);
 
-  if (path.endsWith('/list')) {
-    // Return the available tools
+  // --- /api/mcp-bridge/list ---
+  if (pathname.endsWith('/list')) {
     return res.status(200).json({
       result: {
         tools: [
@@ -15,20 +14,18 @@ export default async function handler(req, res) {
     });
   }
 
-  if (path.endsWith('/call')) {
-    const body = req.body || {};
-    const { name, arguments: args } = body;
+  // --- /api/mcp-bridge/call ---
+  if (pathname.endsWith('/call')) {
+    const { name } = req.body || {};
 
     if (name === 'currencies') {
-      // Example call to your MCP server endpoint
-      // Replace this with your real logic if needed
-      const currencies = ['USD', 'EUR', 'GBP'];
+      const currencies = ['USD', 'EUR', 'GBP', 'JPY'];
       return res.status(200).json({ result: currencies });
     }
 
     return res.status(400).json({ error: 'Unknown tool' });
   }
 
-  // Default: not found
+  // --- default: not found ---
   return res.status(404).json({ error: 'Not found' });
 }

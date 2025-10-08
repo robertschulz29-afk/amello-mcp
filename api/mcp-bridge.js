@@ -1,69 +1,90 @@
-// COMPLETE DROP-IN FILE
-// HTTP bridge for ChatGPT -> Amello MCP JSON-RPC
-// Forwards simplified GET/POST calls to the MCP server at /api/mcp
+// CommonJS MCP bridge endpoint for Vercel
+// Receives { name, arguments } from /api/mcp-bridge/call
+// Forwards to Amello API tools
 
-const MCP_URL = process.env.MCP_URL || "https://amello-mcp.vercel.app/api/mcp";
+const DEFAULT_API_BASE = "https://prod-api.amello.plusline.net/api/v1";
+const API_BASE = process.env.API_BASE || DEFAULT_API_BASE;
+const TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 30000);
 
-export default async function handler(req, res) {
-  const { pathname } = new URL(req.url, `https://${req.headers.host}`);
-
-  // CORS
+function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Accept");
-  if (req.method === "OPTIONS") return res.status(204).end();
-
-  try {
-    // ---------- LIST TOOLS ----------
-    if (pathname.endsWith("/list") || req.method === "GET") {
-      const rpcBody = {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/list"
-      };
-
-      const response = await fetch(MCP_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(rpcBody)
-      });
-
-      const data = await response.json();
-      // unwrap to match GPT expectation: { result: { tools: [...] } }
-      if (data.result && data.result.tools) {
-        return res.status(200).json({ result: { tools: data.result.tools } });
-      }
-      return res.status(500).json({ error: "Unexpected MCP response", data });
-    }
-
-    // ---------- CALL TOOL ----------
-    if (pathname.endsWith("/call") || req.method === "POST") {
-      const { name, arguments: args } = req.body || {};
-      if (!name) return res.status(400).json({ error: "Missing 'name' in body" });
-
-      const rpcBody = {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: { name, arguments: args || {} }
-      };
-
-      const response = await fetch(MCP_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(rpcBody)
-      });
-
-      const data = await response.json();
-      // unwrap JSON-RPC envelope
-      if (data.result) return res.status(200).json(data.result);
-      return res.status(500).json({ error: "Unexpected MCP response", data });
-    }
-
-    // ---------- FALLBACK ----------
-    return res.status(404).json({ error: "Not found" });
-  } catch (err) {
-    console.error("[bridge] error:", err);
-    return res.status(500).json({ error: "Bridge error", details: err.message });
-  }
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, HEAD, OPTIONS");
 }
+function sendJson(res, status, obj) {
+  const str = JSON.stringify(obj);
+  res.statusCode = status;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.setHeader("content-length", Buffer.byteLength(str).toString());
+  res.end(str);
+}
+
+function bearerHeaders() {
+  const t = process.env.AMELLO_API_TOKEN;
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
+async function callApi(method, route, args = {}) {
+  const url = new URL(route, API_BASE);
+  const q = args.query || {};
+  for (const [k, v] of Object.entries(q)) {
+    if (v != null) url.searchParams.set(k, String(v));
+  }
+  const headers = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    ...bearerHeaders(),
+    ...(args.headers || {})
+  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const init = { method, headers, signal: controller.signal };
+  if (method !== "GET" && args.body) init.body = JSON.stringify(args.body);
+  try {
+    const res = await fetch(url.toString(), init);
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} – ${text}`);
+    const ct = res.headers.get("content-type") || "";
+    return ct.includes("application/json") ? JSON.parse(text) : text;
+  } finally { clearTimeout(timer); }
+}
+
+const tools = {
+  "currencies_list": async (args = {}) => {
+    const locale = args.locale || args.query?.locale || "en_DE";
+    const data = await callApi("GET", "/currencies", { query: { locale } });
+    return { ok: true, data: data.data ?? data };
+  },
+  "find_hotels": async (args = {}) => {
+    const data = await callApi("POST", "/find-hotels", { body: args });
+    return { ok: true, data };
+  },
+  "hotels_list": async (args = {}) => {
+    const locale = args.locale || args.query?.locale || "en_DE";
+    const page = args.page || args.query?.page || 1;
+    const data = await callApi("GET", "/hotels", { query: { locale, page } });
+    return { ok: true, data };
+  },
+  "ping": async () => ({ ok: true, message: "pong" })
+};
+
+module.exports = async function handler(req, res) {
+  try {
+    setCors(res);
+    if (req.method === "OPTIONS" || req.method === "HEAD") return res.end();
+    if (req.method !== "POST") return sendJson(res, 405, { error: "Method not allowed" });
+
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+    const { name, arguments: args } = body;
+
+    const fn = tools[name];
+    if (!fn) return sendJson(res, 400, { error: `Unknown tool: ${name}` });
+
+    const result = await fn(args || {});
+    return sendJson(res, 200, result);
+  } catch (e) {
+    return sendJson(res, 500, { error: e.message || String(e) });
+  }
+};

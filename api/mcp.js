@@ -1,6 +1,7 @@
 // api/mcp.js
 // Full Amello MCP endpoint for Vercel
-// Handles JSON-RPC 2.0 and plain {name,arguments} requests.
+// Accepts JSON-RPC 2.0 and plain {name,arguments} calls.
+// Includes safe JSON stringify and compacted currencies_list.
 
 const API_BASE = process.env.API_BASE || "https://prod-api.amello.plusline.net/api/v1";
 const TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 30000);
@@ -12,10 +13,16 @@ function setCors(res) {
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
 }
 function sendJson(res, status, obj) {
-  const s = JSON.stringify(obj);
+  let s;
+  try {
+    s = JSON.stringify(obj);
+  } catch (e) {
+    console.error("[mcp] JSON stringify failed:", e);
+    s = JSON.stringify({ error: "stringify_failed", message: e.message });
+    status = 500;
+  }
   res.statusCode = status;
   res.setHeader("content-type", "application/json; charset=utf-8");
-  res.setHeader("content-length", Buffer.byteLength(s));
   res.end(s);
 }
 const rpcResult = (id, r) => ({ jsonrpc: "2.0", id: id ?? null, result: r });
@@ -26,8 +33,8 @@ async function readStreamUtf8(req){
   const chunks=[]; return await new Promise(r=>{
     req.on?.("data",c=>chunks.push(Buffer.from(c)));
     req.on?.("end",()=>r(Buffer.concat(chunks).toString("utf8")));
-    req.on?.("error",()=>r("");
-  ));
+    req.on?.("error",()=>r(""));
+  });
 }
 async function getJsonBody(req){
   if(req.method!=="POST")return{obj:undefined};
@@ -37,10 +44,10 @@ async function getJsonBody(req){
   catch{return{err:"Invalid JSON"};}
 }
 
-/* ---------- request normalization ---------- */
+/* ---------- normalization ---------- */
 function normalizeReq(x){
   if(!x||typeof x!=="object")return null;
-  if(typeof x.method==="string")return x; // already JSON-RPC
+  if(typeof x.method==="string")return x;
   if(x.name)
     return{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:x.name,arguments:x.arguments||{}}};
   if(x.params?.name&&!x.method)
@@ -48,7 +55,7 @@ function normalizeReq(x){
   return null;
 }
 
-/* ---------- outbound API helpers ---------- */
+/* ---------- outbound ---------- */
 function buildUrl(route){
   const routePath=route?.startsWith("/")?route:`/${route||""}`;
   try{
@@ -102,9 +109,7 @@ function errText(m){return{content:[{type:"text",text:m}],isError:true};}
 const registry=makeRegistry();
 const server=registry;
 
-/* ---------- TOOL DEFINITIONS (Part 1) ---------- */
-
-// ping
+/* ---------- TOOL DEFINITIONS ---------- */
 server.registerTool(
   { name:"ping", description:"Health check: returns pong" },
   async()=>okText("pong",{ok:true,message:"pong"})
@@ -189,11 +194,12 @@ server.registerTool(
     }catch(e){return errText(`find_hotels failed: ${e.message}`);}
   }
 );
-// currencies_list  (fixed output schema)
+
+// currencies_list
 server.registerTool(
   {
     name:"currencies_list",
-    description:"GET /currencies — list currencies for locale",
+    description:"GET /currencies — list currencies for locale (compact)",
     inputSchema:{
       type:"object",
       required:["query"],
@@ -217,9 +223,7 @@ server.registerTool(
             properties:{
               code:{type:"string"},
               name:{type:"string"},
-              symbol:{type:"string"},
-              favorite:{type:"boolean"},
-              decimalPlaces:{type:"integer"}
+              symbol:{type:"string"}
             }
           }
         }
@@ -232,7 +236,8 @@ server.registerTool(
       const query=args?.query??{};
       const data=await callApi("GET","/currencies",{headers,query});
       const list=Array.isArray(data)?data:(data?.data||[]);
-      return okText(`Currencies OK (${list.length})`,{data:list});
+      const compact=list.map(({code,name,symbol})=>({code,name,symbol}));
+      return okText(`Currencies OK (${compact.length})`,{data:compact});
     }catch(e){return errText(`currencies_list failed: ${e.message}`);}
   }
 );
@@ -334,30 +339,21 @@ async function handleRpcSingle(reqObj){
     const args=params?.arguments||{};
     const tool=server.tools.find(t=>t.name===name);
     if(!tool) return rpcError(id,-32601,`Tool not found: ${name}`);
-    try{
-      const out=await tool.handler(args);
-      return rpcResult(id,out);
-    }catch(e){
-      console.error("[mcp] tool error",e);
-      return rpcError(id,-32603,"Tool execution error",e.message||String(e));
-    }
+    try{const out=await tool.handler(args);return rpcResult(id,out);}
+    catch(e){console.error("[mcp] tool error",e);return rpcError(id,-32603,"Tool execution error",e.message||String(e));}
   }
   return rpcError(id,-32601,`Unknown method: ${method}`);
 }
+
 /* ---------- MAIN HANDLER ---------- */
 module.exports=async function handler(req,res){
   try{
     setCors(res);
     if(req.method==="OPTIONS"||req.method==="HEAD"){res.statusCode=204;return res.end();}
     if(req.method==="GET"){
-      return sendJson(
-        res,
-        200,
-        {ok:true,message:"MCP endpoint ready",tools:server.tools.map(t=>({name:t.name,description:t.description}))}
-      );
+      return sendJson(res,200,{ok:true,message:"MCP endpoint ready",tools:server.tools.map(t=>({name:t.name,description:t.description}))});
     }
-    if(req.method!=="POST")
-      return sendJson(res,405,rpcError(null,-32601,"Method not allowed"));
+    if(req.method!=="POST")return sendJson(res,405,rpcError(null,-32601,"Method not allowed"));
 
     const {obj,err}=await getJsonBody(req);
     if(err) return sendJson(res,400,rpcError(null,-32700,"Parse error",err));

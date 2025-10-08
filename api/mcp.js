@@ -1,6 +1,6 @@
 // api/mcp.js
 // Full Amello MCP endpoint for Vercel
-// Adds pagination + response size guard for hotels_list.
+// All tools registered individually for easy editing.
 
 const API_BASE = process.env.API_BASE || "https://prod-api.amello.plusline.net/api/v1";
 const TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 30000);
@@ -19,7 +19,6 @@ function sendJson(res, status, obj) {
     s = JSON.stringify({ error: "stringify_failed", message: e.message });
     status = 500;
   }
-  // trim oversize bodies to keep under runtime limit
   if (Buffer.byteLength(s) > 5_000_000) {
     s = JSON.stringify({ error: "response_trimmed", size: Buffer.byteLength(s) });
     status = 502;
@@ -97,47 +96,121 @@ function makeRegistry(){
 function okText(text,data){return{content:[{type:"text",text}],structuredContent:data};}
 function errText(m){return{content:[{type:"text",text:m}],isError:true};}
 
-const registry=makeRegistry();
-const server=registry;
+const server = makeRegistry();
 
 /* ---------- TOOLS ---------- */
-server.registerTool({name:"ping",description:"Health check"},async()=>okText("pong",{ok:true}));
 
-// currencies_list (compact)
+// 1. ping
 server.registerTool(
-  {name:"currencies_list",description:"GET /currencies"},
-  async(args)=>{
-    try{
-      const data=await callApi("GET","/currencies",{query:args?.query??{}});
-      const list=Array.isArray(data)?data:(data?.data||[]);
-      const compact=list.map(({code,name,symbol})=>({code,name,symbol}));
-      return okText(`Currencies OK (${compact.length})`,{data:compact});
-    }catch(e){return errText(`currencies_list failed: ${e.message}`);}
+  { name: "ping", description: "Health check" },
+  async () => okText("pong", { ok: true })
+);
+
+// 2. currencies_list
+server.registerTool(
+  { name: "currencies_list", description: "GET /currencies" },
+  async (args) => {
+    try {
+      const data = await callApi("GET", "/currencies", { query: args?.query ?? {} });
+      const list = Array.isArray(data) ? data : (data?.data || []);
+      const compact = list.map(({ code, name, symbol }) => ({ code, name, symbol }));
+      return okText(`Currencies OK (${compact.length})`, { data: compact });
+    } catch (e) {
+      return errText(`currencies_list failed: ${e.message}`);
+    }
   }
 );
 
-// hotels_list (paginated + safe)
+// 3. hotels_list
 server.registerTool(
-  {name:"hotels_list",description:"GET /hotels — paginated"},
-  async(args)=>{
-    try{
-      const query=args?.query??{locale:"en_DE",page:1};
-      const headers=args?.headers??{};
-      const data=await callApi("GET","/hotels",{headers,query});
-      const list=Array.isArray(data)?data:(data?.data||[]);
-      // shrink to first 50 to stay within limits
-      const sample=list.slice(0,50).map(h=>({
-        code:h.code,name:h.name||h.hotelName||h.id,city:h.city||h.location||"",country:h.country||""
+  { name: "hotels_list", description: "GET /hotels — paginated" },
+  async (args) => {
+    try {
+      const query = args?.query ?? { locale: "en_DE", page: 1 };
+      const headers = args?.headers ?? {};
+      const data = await callApi("GET", "/hotels", { headers, query });
+      const list = Array.isArray(data) ? data : (data?.data || []);
+      const sample = list.slice(0, 50).map(h => ({
+        code: h.code,
+        name: h.name || h.hotelName || h.id,
+        city: h.city || h.location || "",
+        country: h.country || ""
       }));
-      return okText(`Hotels OK (${sample.length}/${list.length})`,{data:sample});
-    }catch(e){return errText(`hotels_list failed: ${e.message}`);}
+      return okText(`Hotels OK (${sample.length}/${list.length})`, { data: sample });
+    } catch (e) {
+      return errText(`hotels_list failed: ${e.message}`);
+    }
   }
 );
 
-// other original tools omitted for brevity (still include yours)
-["booking_search","booking_cancel","find_hotels","hotel_offers","hotel_reference","crapi_hotel_contact","package_offer"].forEach(name=>{
-  server.registerTool({name,description:`placeholder for ${name}`},async()=>okText(`${name} stub`));
-});
+// 4. list_hotel_collection
+server.registerTool(
+  { name: "list_hotel_collection", description: "GET /hotels — hotel collection by locale + page" },
+  async (args) => {
+    try {
+      const query = {
+        locale: args?.locale || "en_DE",
+        page: args?.page || 1
+      };
+      const headers = args?.headers ?? {};
+      const data = await callApi("GET", "/hotels", { headers, query });
+      const list = Array.isArray(data) ? data : (data?.data || []);
+      const sample = list.slice(0, 50).map(h => ({
+        id: h.id || h.code,
+        name: h.name || h.hotelName || "",
+        city: h.city || h.location || "",
+        country: h.country || "",
+        brand: h.brand?.name || null,
+        category: h.hotelCategory || h.starRating || null
+      }));
+      return okText(`Hotel collection OK (${sample.length}/${list.length})`, { data: sample });
+    } catch (e) {
+      return errText(`list_hotel_collection failed: ${e.message}`);
+    }
+  }
+);
+
+// 5. booking_search
+server.registerTool(
+  { name: "booking_search", description: "placeholder for booking_search" },
+  async () => okText("booking_search stub")
+);
+
+// 6. booking_cancel
+server.registerTool(
+  { name: "booking_cancel", description: "placeholder for booking_cancel" },
+  async () => okText("booking_cancel stub")
+);
+
+// 7. find_hotels
+server.registerTool(
+  { name: "find_hotels", description: "placeholder for find_hotels" },
+  async () => okText("find_hotels stub")
+);
+
+// 8. hotel_offers
+server.registerTool(
+  { name: "hotel_offers", description: "placeholder for hotel_offers" },
+  async () => okText("hotel_offers stub")
+);
+
+// 9. hotel_reference
+server.registerTool(
+  { name: "hotel_reference", description: "placeholder for hotel_reference" },
+  async () => okText("hotel_reference stub")
+);
+
+// 10. crapi_hotel_contact
+server.registerTool(
+  { name: "crapi_hotel_contact", description: "placeholder for crapi_hotel_contact" },
+  async () => okText("crapi_hotel_contact stub")
+);
+
+// 11. package_offer
+server.registerTool(
+  { name: "package_offer", description: "placeholder for package_offer" },
+  async () => okText("package_offer stub")
+);
 
 /* ---------- RPC ---------- */
 async function handleRpcSingle(reqObj){
@@ -157,7 +230,7 @@ async function handleRpcSingle(reqObj){
 }
 
 /* ---------- MAIN ---------- */
-module.exports=async function handler(req,res){
+module.exports = async function handler(req,res){
   try{
     setCors(res);
     if(req.method==="OPTIONS"||req.method==="HEAD"){res.statusCode=204;return res.end();}

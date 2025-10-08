@@ -1,6 +1,6 @@
 // api/mcp.js
 // Full Amello MCP endpoint for Vercel
-// All tools registered individually for easy editing.
+// Individual tool registration + real find_hotels + list_hotel_collection.
 
 const API_BASE = process.env.API_BASE || "https://prod-api.amello.plusline.net/api/v1";
 const TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS || 30000);
@@ -34,8 +34,8 @@ async function readStreamUtf8(req){
   const chunks=[];return await new Promise(r=>{
     req.on?.("data",c=>chunks.push(Buffer.from(c)));
     req.on?.("end",()=>r(Buffer.concat(chunks).toString("utf8")));
-    req.on?.("error",()=>r(""));
-  });
+    req.on?.("error",()=>r("");
+  )});
 }
 async function getJsonBody(req){
   if(req.method!=="POST")return{obj:undefined};
@@ -148,10 +148,7 @@ server.registerTool(
   { name: "list_hotel_collection", description: "GET /hotels — hotel collection by locale + page" },
   async (args) => {
     try {
-      const query = {
-        locale: args?.locale || "en_DE",
-        page: args?.page || 1
-      };
+      const query = { locale: args?.locale || "en_DE", page: args?.page || 1 };
       const headers = args?.headers ?? {};
       const data = await callApi("GET", "/hotels", { headers, query });
       const list = Array.isArray(data) ? data : (data?.data || []);
@@ -182,10 +179,42 @@ server.registerTool(
   async () => okText("booking_cancel stub")
 );
 
-// 7. find_hotels
+// 7. find_hotels (REAL IMPLEMENTATION)
 server.registerTool(
-  { name: "find_hotels", description: "placeholder for find_hotels" },
-  async () => okText("find_hotels stub")
+  { name: "find_hotels", description: "POST /find-hotels — search hotels by destination and date range" },
+  async (args) => {
+    try {
+      const body = {
+        destination: args?.destination,
+        departureDate: args?.departureDate,
+        returnDate: args?.returnDate,
+        currency: args?.currency || "EUR",
+        locale: args?.locale || "en_DE",
+        roomConfigurations: args?.roomConfigurations || [
+          {
+            travellers: {
+              adults: args?.adults || 1,
+              children: args?.children || []
+            }
+          }
+        ]
+      };
+      const data = await callApi("POST", "/find-hotels", { body });
+      const list = Array.isArray(data?.results) ? data.results : [];
+      const sample = list.slice(0, 10).map(h => ({
+        id: h.hotel?.id,
+        name: h.hotel?.name,
+        city: h.location?.city,
+        country: h.location?.country,
+        brand: h.brand?.name,
+        rating: h.starRating,
+        hasOffers: h.hasOffers
+      }));
+      return okText(`Found ${sample.length} hotels`, { data: sample });
+    } catch (e) {
+      return errText(`find_hotels failed: ${e.message}`);
+    }
+  }
 );
 
 // 8. hotel_offers

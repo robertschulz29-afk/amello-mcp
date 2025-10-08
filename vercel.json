@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/api/mcp-bridge/list", "destination": "/api/mcp-bridge" },
+    { "source": "/api/mcp-bridge/call", "destination": "/api/mcp-bridge" }
+  ]
+}

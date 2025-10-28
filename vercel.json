@@ -1,16 +1,1 @@
-{
-  "rewrites": [
-    { "source": "/api/mcp-bridge/list", "destination": "/api/mcp-bridge" },
-    { "source": "/api/mcp-bridge/call", "destination": "/api/mcp-bridge" }
-  ]
-{
-  "functions": {
-    "api/mcp.js": {
-      "runtime": "nodejs18.x",
-      "memory": 1024,
-      "maxDuration": 30
-    }
-  }
 
-
-}
